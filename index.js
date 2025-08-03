@@ -85,13 +85,16 @@ async function scrapeAndPopulate() {
 
     const description = $el.find(".uw-event-excerpt p").text().trim();
 
+    // Determine the type based on the title
+    const type = title.includes("CAIRIBU") ? "CAIRIBU" : "External";
+
     // Build your object, including zoomLink
     const evt = {
       title,
       date:        startDate,
       location,
       description,
-      type:        "meeting",
+      type,        // <-- set based on title
       zoomLink,                       // <-- newly added field
     };
     if (endDate)     evt.endDate     = endDate;

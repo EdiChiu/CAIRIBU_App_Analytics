@@ -1,7 +1,8 @@
 // populate-events.js
 
-const admin   = require("firebase-admin");
-const axios   = require("axios");
+const admin = require("firebase-admin");
+const axios = require("axios");
+const ical = require("node-ical");
 const cheerio = require("cheerio");
 
 // 1) Replace with your downloaded key filename:
@@ -29,79 +30,155 @@ const http = axios.create({
   },
 });
 
-const EVENTS_URL = "https://cairibu.urology.wisc.edu/events-listing/";
+// Public Google Calendar (.ics) feed for the calendar in the embed link.
+// Calendar ID extracted from:
+// https://calendar.google.com/calendar/u/0/embed?src=<CALENDAR_ID>
+const CALENDAR_ID =
+  "a25c65a0f44d5190d933872283a17c48d1fa153697f18e2c5c35e0d03742ac94@group.calendar.google.com";
+// Public ICS feed URL (no auth needed for public calendars)
+const CALENDAR_ICS_URL = `https://calendar.google.com/calendar/ical/${encodeURIComponent(
+  CALENDAR_ID
+)}/public/basic.ics`;
+
+function formatDateOnly(value) {
+  if (!value) return null;
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function formatEndDateOnly(ev) {
+  if (!ev || !ev.end) return null;
+  // For all-day events, iCal end is typically exclusive. Convert to inclusive end date.
+  if (ev.datetype === "date" && ev.end instanceof Date) {
+    const inclusive = new Date(ev.end);
+    inclusive.setDate(inclusive.getDate() - 1);
+    return formatDateOnly(inclusive);
+  }
+  return formatDateOnly(ev.end);
+}
+
+function firstUrlInText(text) {
+  if (!text) return "";
+  const match = String(text).match(/https?:\/\/[^\s)\]}>,]+/i);
+  return match ? match[0] : "";
+}
+
+function computeTypeFromTitle(title) {
+  return /\bcairibu\b/i.test(title) ? "CAIRIBU" : "External";
+}
+
+function normalizeAttendeesField(attendees) {
+  // Public calendars typically don't expose attendees.
+  // Preserve any provided list if present, otherwise omit.
+  if (!attendees) return null;
+  if (Array.isArray(attendees)) return attendees;
+  return null;
+}
+
+function cleanDescriptionToText(input) {
+  if (!input) return "";
+  const raw = String(input);
+
+  // If it doesn't look like HTML, just normalize whitespace a bit.
+  if (!/[<>]/.test(raw)) return raw.replace(/\s+/g, " ").trim();
+
+  // Preserve some structure before stripping tags.
+  let html = raw
+    .replace(/<\s*br\s*\/?>/gi, "\n")
+    .replace(/<\s*\/\s*p\s*>/gi, "\n")
+    .replace(/<\s*p\b[^>]*>/gi, "");
+
+  // Collect href URLs so we don't lose links when converting to text.
+  const $ = cheerio.load(html, { decodeEntities: true });
+  const hrefs = [];
+  $("a[href]").each((_, a) => {
+    const href = $(a).attr("href");
+    if (href && /^https?:\/\//i.test(href)) hrefs.push(href);
+  });
+
+  // Get visible text.
+  let text = $.text();
+
+  // Append unique hrefs that aren't already present in the text.
+  const uniqHrefs = Array.from(new Set(hrefs));
+  const missing = uniqHrefs.filter((u) => !text.includes(u));
+  if (missing.length) {
+    text = `${text}\n${missing.join("\n")}`;
+  }
+
+  // Normalize whitespace while keeping newlines.
+  text = text
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trimEnd())
+    .join("\n")
+    .trim();
+
+  return text;
+}
 
 async function scrapeAndPopulate() {
-  console.log("Fetching events page…");
-  const { data: html, status } = await http.get(EVENTS_URL);
+  console.log("Fetching public Google Calendar (.ics)…");
+  const { data: icsText, status } = await http.get(CALENDAR_ICS_URL, {
+    headers: {
+      Accept: "text/calendar,text/plain;q=0.9,*/*;q=0.8",
+    },
+  });
   if (status !== 200) throw new Error(`Unexpected HTTP status: ${status}`);
-  console.log("Page fetched, parsing…");
+  console.log("Calendar fetched, parsing…");
 
-  const $ = cheerio.load(html);
-  const items = $("li.uw-event");
-  console.log(`Found ${items.length} events in HTML.`);
+  // node-ical can parse raw ICS text
+  const parsed = ical.parseICS(icsText);
+  const vevents = Object.values(parsed).filter((c) => c && c.type === "VEVENT");
+  console.log(`Found ${vevents.length} VEVENTs in calendar.`);
 
   const events = [];
-  items.each((_, el) => {
-    const $el = $(el);
+  for (const ev of vevents) {
+    const title = (ev.summary || "").trim();
+    if (!title) continue;
 
-    const title = $el.find(".uw-event-title a").text().trim();
-    if (!title) return;
+    const startDate = formatDateOnly(ev.start);
+    if (!startDate) continue;
 
-    const times     = $el.find(".uw-event-listing > p span time");
-    const startDate = times.eq(0).attr("datetime");
-    if (!startDate) return;
-    const endDate = times.eq(1).attr("datetime") || null;
+    const endDate = formatEndDateOnly(ev);
 
-    // Extract the time after '@' for EDT time
-    const timeAfterAtText = $el.find(".uw-event-listing > p span").text();
-    const timeAfterAtMatch = timeAfterAtText.match(/@\s*(.*?EDT\s*\-\s*.*?EDT)/);
-    const timeAfterAt = timeAfterAtMatch ? timeAfterAtMatch[0].trim() : "";
+    const description = cleanDescriptionToText(ev.description || "");
+    const location = (ev.location || "").trim();
 
-    let location = $el
-      .find(".uw-event-listing > p")
-      .first()
-      .clone()
-      .find("span, a, br")
-      .remove()
-      .end()
-      .text()
-      .replace(/\s+/g, " ")
-      .trim();
+    const moreInfoUrl = ev.url ? String(ev.url) : null;
 
-    // Append the time to the location if available
-    location = timeAfterAt ? `${timeAfterAt} ${location}`.trim() : location;
+    // Try to extract a Zoom link from description or location
+    const zoomLink =
+      (/zoom/i.test(description) ? firstUrlInText(description) : "") ||
+      (/zoom/i.test(location) ? firstUrlInText(location) : "") ||
+      "";
 
-    // “More Information” link from event title
-    const moreInfoUrl = $el
-      .find(".uw-event-title a")
-      .attr("href") || null;
+    const type = computeTypeFromTitle(title);
 
-    // NEW: Zoom link (detect any anchor whose text contains “zoom”)
-    const zoomLink = $el
-      .find(".uw-event-listing > p a")
-      .filter((_, a) => /zoom/i.test($(a).text()))
-      .attr("href") || "";
-
-    const description = $el.find(".uw-event-excerpt p").text().trim();
-
-    // Determine the type based on the title
-    const type = title.includes("CAIRIBU") ? "CAIRIBU" : "External";
-
-    // Build your object, including zoomLink
     const evt = {
       title,
-      date:        startDate,
+      date: startDate,
       location,
       description,
-      type,        // <-- set based on title
-      zoomLink,                       // <-- newly added field
+      type,
+      zoomLink,
     };
-    if (endDate)     evt.endDate     = endDate;
+    if (endDate) evt.endDate = endDate;
     if (moreInfoUrl) evt.moreInfoUrl = moreInfoUrl;
 
+    // Preserve UID if present for stable document IDs
+    if (ev.uid) evt.sourceUid = String(ev.uid);
+
+    const attendees = normalizeAttendeesField(ev.attendee);
+    if (attendees) evt.attendees = attendees;
+
     events.push(evt);
-  });
+  }
 
   console.log("Replacing Firestore `events` collection…");
   // Delete all old docs
@@ -117,7 +194,11 @@ async function scrapeAndPopulate() {
   if (events.length) {
     const writeBatch = db.batch();
     events.forEach((e) => {
-      writeBatch.set(db.collection("events").doc(), e);
+      // Use a stable doc ID when possible to avoid churn between runs.
+      const docRef = e.sourceUid
+        ? db.collection("events").doc(String(e.sourceUid).replace(/\//g, "_"))
+        : db.collection("events").doc();
+      writeBatch.set(docRef, e);
     });
     await writeBatch.commit();
     console.log(`Wrote ${events.length} new documents.`);

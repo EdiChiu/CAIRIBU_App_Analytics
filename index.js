@@ -35,6 +35,17 @@ const http = axios.create({
 // https://calendar.google.com/calendar/u/0/embed?src=<CALENDAR_ID>
 const CALENDAR_ID =
   "a25c65a0f44d5190d933872283a17c48d1fa153697f18e2c5c35e0d03742ac94@group.calendar.google.com";
+
+// NOTE: If events are missing from the ICS feed, those events are either:
+// 1. In a different calendar that's overlaid in your view
+// 2. Not yet synced to the public ICS feed (can take up to 24 hours)
+// 3. Have privacy settings preventing them from appearing in public feeds
+// 
+// To verify which calendar an event belongs to:
+// - Open the event in Google Calendar
+// - Check the calendar name shown in the event details
+// - Get that calendar's ID from its settings and update CALENDAR_ID above
+
 // Public ICS feed URL (no auth needed for public calendars)
 const CALENDAR_ICS_URL = `https://calendar.google.com/calendar/ical/${encodeURIComponent(
   CALENDAR_ID
@@ -134,8 +145,55 @@ async function scrapeAndPopulate() {
 
   // node-ical can parse raw ICS text
   const parsed = ical.parseICS(icsText);
-  const vevents = Object.values(parsed).filter((c) => c && c.type === "VEVENT");
-  console.log(`Found ${vevents.length} VEVENTs in calendar.`);
+  let vevents = Object.values(parsed).filter((c) => c && c.type === "VEVENT");
+
+  // Extract recurring event instances (stored in recurrences object)
+  const recurringInstances = [];
+  vevents.forEach(ev => {
+    if (ev.recurrences) {
+      Object.values(ev.recurrences).forEach(instance => {
+        if (instance && instance.type === "VEVENT") {
+          recurringInstances.push(instance);
+        }
+      });
+    }
+  });
+  
+  // Expand recurring events using rrule
+  const expandedEvents = [];
+  const now = new Date();
+  const futureLimit = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000); // 1 year ahead
+  
+  vevents.forEach(ev => {
+    if (ev.rrule) {
+      try {
+        // Get all dates for this recurring event
+        const dates = ev.rrule.between(now, futureLimit, true);
+        
+        dates.forEach(date => {
+          // Create a copy of the event for each occurrence
+          const instance = {
+            ...ev,
+            start: date,
+            // Calculate end time based on duration
+            end: ev.end ? new Date(date.getTime() + (ev.end.getTime() - ev.start.getTime())) : date,
+            // Mark as expanded so we can give it a unique UID
+            isExpanded: true,
+            originalStart: ev.start
+          };
+          expandedEvents.push(instance);
+        });
+      } catch (err) {
+        // Silently skip events that can't be expanded
+      }
+    }
+  });
+  
+  // Combine base events, recurring instances, and expanded events
+  // Filter out base events that have rrules since we're expanding them separately
+  const baseEventsWithoutRrules = vevents.filter(ev => !ev.rrule);
+  vevents = [...baseEventsWithoutRrules, ...recurringInstances, ...expandedEvents];
+  console.log(`Found ${vevents.length} events (${baseEventsWithoutRrules.length} base, ${recurringInstances.length} instances, ${expandedEvents.length} expanded from recurring rules).`);
 
   const events = [];
   for (const ev of vevents) {
@@ -172,7 +230,15 @@ async function scrapeAndPopulate() {
     if (moreInfoUrl) evt.moreInfoUrl = moreInfoUrl;
 
     // Preserve UID if present for stable document IDs
-    if (ev.uid) evt.sourceUid = String(ev.uid);
+    // For recurring instances, append the start date to make them unique
+    if (ev.uid) {
+      let uid = String(ev.uid);
+      // If this is a recurring instance (has recurrenceid), make the UID unique
+      if (ev.recurrenceid || ev.isExpanded) {
+        uid = `${uid}_${startDate}`;
+      }
+      evt.sourceUid = uid;
+    }
 
     const attendees = normalizeAttendeesField(ev.attendee);
     if (attendees) evt.attendees = attendees;
@@ -181,6 +247,7 @@ async function scrapeAndPopulate() {
   }
 
   console.log("Replacing Firestore `events` collection…");
+  
   // Delete all old docs
   const oldDocs = await db.collection("events").listDocuments();
   if (oldDocs.length) {

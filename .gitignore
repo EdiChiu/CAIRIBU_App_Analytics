@@ -1,0 +1,10 @@
+serviceAccountKey.json
+.streamlit/secrets.toml
+.env
+venv/
+.venv/
+__pycache__/
+.pytest_cache/
+.DS_Store
+.idea/
+.vscode/

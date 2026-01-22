@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import datetime
 from dateutil import parser
+import os
+import json
 
 # Firebase Admin SDK for Python
 import firebase_admin
@@ -9,12 +11,45 @@ from firebase_admin import credentials, firestore
 
 st.set_page_config(page_title="Signup Timeline", layout="wide")
 
+
+def get_service_account_cred():
+    """Return a firebase_admin.credentials.Certificate loaded from:
+    1) `st.secrets['firebase_service_account']` (Streamlit Cloud recommended)
+    2) `FIREBASE_SERVICE_ACCOUNT` env var containing the JSON string
+    3) Local file `serviceAccountKey.json` (fallback for local dev only)
+    """
+    # 1) Streamlit secrets (on Streamlit Cloud this can be a dict or JSON string)
+    try:
+        sa = st.secrets.get("firebase_service_account")
+    except Exception:
+        sa = None
+
+    if sa:
+        if isinstance(sa, dict):
+            return credentials.Certificate(sa)
+        try:
+            return credentials.Certificate(json.loads(sa))
+        except Exception:
+            # fallthrough to next option
+            pass
+
+    # 2) Environment variable (JSON string)
+    sa_env = os.environ.get("FIREBASE_SERVICE_ACCOUNT") or os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if sa_env:
+        try:
+            return credentials.Certificate(json.loads(sa_env))
+        except Exception:
+            pass
+
+    # 3) Local file fallback (dev only)
+    return credentials.Certificate("serviceAccountKey.json")
+
 @st.cache_data(ttl=300)
 def load_users():
     try:
-        cred = credentials.Certificate("serviceAccountKey.json")
+        cred = get_service_account_cred()
     except Exception as e:
-        st.error("serviceAccountKey.json not found or invalid: {}".format(e))
+        st.error("Service account credential not available or invalid: {}".format(e))
         return pd.DataFrame()
 
     try:
@@ -22,7 +57,7 @@ def load_users():
         if not firebase_admin._apps:
             firebase_admin.initialize_app(cred)
     except Exception:
-        # Already initialized
+        # Already initialized or initialization failed
         pass
 
     db = firestore.client()
@@ -102,7 +137,7 @@ def load_events_attendees():
     """
     try:
         if not firebase_admin._apps:
-            cred = credentials.Certificate("serviceAccountKey.json")
+            cred = get_service_account_cred()
             firebase_admin.initialize_app(cred)
     except Exception:
         pass
@@ -163,7 +198,7 @@ def load_user_profiles():
     """
     try:
         if not firebase_admin._apps:
-            cred = credentials.Certificate("serviceAccountKey.json")
+            cred = get_service_account_cred()
             firebase_admin.initialize_app(cred)
     except Exception:
         pass

@@ -1,0 +1,6 @@
+streamlit
+firebase-admin
+pandas
+python-dateutil
+altair
+google-cloud-firestore

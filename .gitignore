@@ -5,3 +5,4 @@ serviceAccountKey.json
 .vscode/
 .idea/
 coverage/
+serviceAccountKey.json

@@ -238,6 +238,7 @@ async function scrapeAndPopulate() {
         uid = `${uid}_${startDate}`;
       }
       evt.sourceUid = uid;
+      evt._sourcePriority = ev.recurrenceid ? 2 : ev.isExpanded ? 1 : 0;
     }
 
     const attendees = normalizeAttendeesField(ev.attendee);
@@ -245,6 +246,23 @@ async function scrapeAndPopulate() {
 
     events.push(evt);
   }
+
+  const dedupedEvents = [];
+  const eventsBySourceUid = new Map();
+
+  for (const evt of events) {
+    if (!evt.sourceUid) {
+      dedupedEvents.push(evt);
+      continue;
+    }
+
+    const existing = eventsBySourceUid.get(evt.sourceUid);
+    if (!existing || (evt._sourcePriority || 0) >= (existing._sourcePriority || 0)) {
+      eventsBySourceUid.set(evt.sourceUid, evt);
+    }
+  }
+
+  dedupedEvents.push(...eventsBySourceUid.values());
 
   console.log("Replacing Firestore `events` collection…");
   
@@ -258,17 +276,18 @@ async function scrapeAndPopulate() {
   }
 
   // Write new ones
-  if (events.length) {
+  if (dedupedEvents.length) {
     const writeBatch = db.batch();
-    events.forEach((e) => {
+    dedupedEvents.forEach((e) => {
+      const { _sourcePriority, ...eventToWrite } = e;
       // Use a stable doc ID when possible to avoid churn between runs.
-      const docRef = e.sourceUid
-        ? db.collection("events").doc(String(e.sourceUid).replace(/\//g, "_"))
+      const docRef = eventToWrite.sourceUid
+        ? db.collection("events").doc(String(eventToWrite.sourceUid).replace(/\//g, "_"))
         : db.collection("events").doc();
-      writeBatch.set(docRef, e);
+      writeBatch.set(docRef, eventToWrite);
     });
     await writeBatch.commit();
-    console.log(`Wrote ${events.length} new documents.`);
+    console.log(`Wrote ${dedupedEvents.length} new documents.`);
   } else {
     console.log("No events to write!");
   }
